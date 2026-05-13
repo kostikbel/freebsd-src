@@ -792,6 +792,15 @@ is specified and the process is in capability mode.
 .Fn open
 was called and the process is in capability mode.
 .It Bq Er ENOTCAPABLE
+.Fn openat
+with the
+.Dv O_PATH
+and
+.Dv O_EMPTY_PATH
+flag set was called,
+the specified path was empty,
+and the process is in capability mode,
+.It Bq Er ENOTCAPABLE
 .Fa path
 is an absolute path and the process is in capability mode.
 .It Bq Er ENOTCAPABLE

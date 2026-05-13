@@ -286,6 +286,13 @@ restart:
 			bwillwrite();
 		if ((error = namei(ndp)) != 0)
 			return (error);
+		if ((fmode & O_PATH) != 0 &&
+		    (ndp->ni_resflags & NIRES_EMPTYPATH) != 0 &&
+		    (cred->cr_flags & CRED_FLAG_CAPMODE) != 0) {
+			vp = ndp->ni_vp;
+			error = ENOTCAPABLE;
+			goto bad;
+		}
 		if (ndp->ni_vp == NULL) {
 			if ((fmode & O_NAMEDATTR) != 0 &&
 			    (ndp->ni_dvp->v_mount->mnt_flag & MNT_NAMEDATTR) ==
@@ -369,6 +376,12 @@ restart:
 		if ((error = namei(ndp)) != 0)
 			return (error);
 		vp = ndp->ni_vp;
+		if ((fmode & O_PATH) != 0 &&
+		    (ndp->ni_resflags & NIRES_EMPTYPATH) != 0 &&
+		    (cred->cr_flags & CRED_FLAG_CAPMODE) != 0) {
+			error = ENOTCAPABLE;
+			goto bad;
+		}
 		if ((fmode & O_NAMEDATTR) != 0) {
 			error = vfs_check_namedattr(vp);
 			if (error != 0)
@@ -388,7 +401,8 @@ restart:
 	return (0);
 bad:
 	NDFREE_PNBUF(ndp);
-	vput(vp);
+	if (vp != NULL)
+		vput(vp);
 	*flagp = fmode;
 	ndp->ni_vp = NULL;
 	return (error);
