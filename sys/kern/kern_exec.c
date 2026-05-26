@@ -385,6 +385,33 @@ execve_nosetid(struct image_params *imgp)
 	}
 }
 
+bool
+execve_block(struct thread *td, struct proc *p)
+{
+	PROC_LOCK_ASSERT(p, MA_OWNED);
+
+	if ((p->p_flag & P_INEXEC) != 0) {
+		p->p_flag |= P_INEXEC_WAIT;
+		msleep(&p->p_execblock, &p->p_mtx, PDROP, "inexec", 0);
+		return (false);
+	}
+	p->p_execblock++;
+	return (true);
+}
+
+void
+execve_unblock(struct thread *td, struct proc *p)
+{
+	PROC_LOCK_ASSERT(p, MA_OWNED);
+	MPASS(p->p_execblock > 0);
+
+	p->p_execblock--;
+	if ((p->p_flag & P_INEXEC_WAIT) != 0) {
+		p->p_flag &= ~P_INEXEC_WAIT;
+		wakeup(&p->p_execblock);
+	}
+}
+
 /*
  * In-kernel implementation of execve().  All arguments are assumed to be
  * userspace pointers from the passed thread.
@@ -440,6 +467,10 @@ do_execve(struct thread *td, struct image_args *args, struct mac *mac_p,
 	PROC_LOCK(p);
 	KASSERT((p->p_flag & P_INEXEC) == 0,
 	    ("%s(): process already has P_INEXEC flag", __func__));
+	while (p->p_execblock != 0) {
+		p->p_flag |= P_INEXEC_WAIT;
+		msleep(&p->p_execblock, &p->p_mtx, 0, "exeblk", 0);
+	}
 	p->p_flag |= P_INEXEC;
 	PROC_UNLOCK(p);
 
@@ -910,7 +941,9 @@ interpret:
 	 * as we're now a bona fide freshly-execed process.
 	 */
 	KNOTE_LOCKED(p->p_klist, NOTE_EXEC);
-	p->p_flag &= ~P_INEXEC;
+	if ((p->p_flag & P_INEXEC_WAIT) != 0)
+		wakeup(&p->p_execblock);
+	p->p_flag &= ~(P_INEXEC | P_INEXEC_WAIT);
 
 	/* clear "fork but no exec" flag, as we _are_ execing */
 	p->p_acflag &= ~AFORK;
@@ -1006,7 +1039,9 @@ exec_fail_dealloc:
 exec_fail:
 		/* we're done here, clear P_INEXEC */
 		PROC_LOCK(p);
-		p->p_flag &= ~P_INEXEC;
+		if ((p->p_flag & P_INEXEC_WAIT) != 0)
+			wakeup(&p->p_execblock);
+		p->p_flag &= ~(P_INEXEC | P_INEXEC_WAIT);
 		PROC_UNLOCK(p);
 
 		SDT_PROBE1(proc, , , exec__failure, error);
