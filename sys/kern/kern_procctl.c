@@ -1175,9 +1175,15 @@ sys_procctl(struct thread *td, struct procctl_args *uap)
 static int
 kern_procctl_single(struct thread *td, struct proc *p, int com, void *data)
 {
+	int error;
 
 	PROC_LOCK_ASSERT(p, MA_OWNED);
-	return (procctl_cmds_info[com].exec(td, p, data));
+	if ((p->p_flag & P_WEXIT) != 0)
+		return (ESRCH);
+	_PHOLD(p);
+	error = procctl_cmds_info[com].exec(td, p, data);
+	_PRELE(p);
+	return (error);
 }
 
 int
