@@ -51,6 +51,7 @@
 #include <sys/sleepqueue.h>
 #include <sys/sx.h>
 #include <sys/syscallsubr.h>
+#include <sys/sysctl.h>
 #include <sys/sysent.h>
 #include <sys/sysproto.h>
 #include <sys/vnode.h>
@@ -1098,6 +1099,10 @@ ptraceimpl(struct thread *td, int req, bool pd_mode, int pid, void *addr,
 	proctree_locked = false;
 	p2_req_set = false;
 	pfp = NULL;
+
+	if (IN_CAPABILITY_MODE(td) && (!allow_ptrace_in_cap_mode ||
+	    (req == PT_ATTACH && !pd_mode)))
+		return (ECAPMODE);
 
 	/* Lock proctree before locking the process. */
 	switch (req) {
