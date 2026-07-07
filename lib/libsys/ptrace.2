@@ -189,6 +189,12 @@ process, even if the requesting process' jail is an ancestor of the target
 process'.
 These requests will fail with error
 .Er ESRCH .
+.It Dv security.bsd.ptrace_in_cap_mode
+Setting this sysctl to true allows the
+.Fn ptrace
+requests, except
+.Dv PT_ATTACH,
+issued by the processes in capability mode.
 .It Dv securelevel and init
 The
 .Xr init 1
@@ -1520,6 +1526,17 @@ enough.
 .Fa pve_pathlen
 holds the minimum buffer size required on return.
 .El
+.It Bq ECAPMODE
+The process issuing the
+.Fn ptrace
+call is in capability mode, and either the
+.Dv security.bsd.ptrace_in_cap_mode
+tunable is set to
+.Dv false,
+or, when the tunable is set to
+.Dv true ,
+the request is
+.Dv PT_ATTACH .
 .El
 .Sh SEE ALSO
 .Xr execve 2 ,
