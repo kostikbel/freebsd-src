@@ -106,7 +106,9 @@ struct fd_domain
 struct procinfo {
 	LIST_ENTRY(procinfo) entries;
 	pid_t pid;
+	int pfd;
 	struct procabi *abi;
+	bool herald_printed;
 
 	LIST_HEAD(, threadinfo) threadlist;
 	LIST_HEAD(, fd_domain) fdlist;
@@ -117,6 +119,9 @@ struct trussinfo
 	int flags;
 	int strsize;
 	FILE *outfile;
+	int pdkq;
+	bool cap_mode;
+	bool force_cap_mode;
 
 	struct timespec start_time;
 

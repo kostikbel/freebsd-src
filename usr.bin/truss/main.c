@@ -31,13 +31,14 @@
  * SUCH DAMAGE.
  */
 
-#include <sys/cdefs.h>
 /*
  * The main module for truss.  Surprisingly simple, but, then, the other
  * files handle the bulk of the work.  And, of course, the kernel has to
  * do a lot of the work :).
  */
 
+#include <sys/capsicum.h>
+#include <sys/event.h>
 #include <sys/ptrace.h>
 
 #include <err.h>
@@ -57,8 +58,8 @@ static __dead2 void
 usage(void)
 {
 	fprintf(stderr, "%s\n%s\n",
-	    "usage: truss [-cfaedDHS] [-o file] [-s strsize] -p pid",
-	    "       truss [-cfaedDHS] [-o file] [-s strsize] command [args]");
+	    "usage: truss [-cfaedyYDHS] [-o file] [-s strsize] -p pid",
+	    "       truss [-cfaedyYDHS] [-o file] [-s strsize] command [args]");
 	exit(1);
 }
 
@@ -85,7 +86,7 @@ main(int ac, char **av)
 	trussinfo->strsize = 32;
 	trussinfo->curthread = NULL;
 	LIST_INIT(&trussinfo->proclist);
-	while ((c = getopt(ac, av, "p:o:facedDs:SH")) != -1) {
+	while ((c = getopt(ac, av, "p:o:facedyYDs:SH")) != -1) {
 		switch (c) {
 		case 'p':	/* specified pid */
 			pid = atoi(optarg);
@@ -121,6 +122,13 @@ main(int ac, char **av)
 			if (errstr)
 				errx(1, "maximum string size is %s: %s", errstr, optarg);
 			break;
+		case 'y':
+			trussinfo->cap_mode = true;
+			break;
+		case 'Y':
+			trussinfo->cap_mode = true;
+			trussinfo->force_cap_mode = true;
+			break;
 		case 'S':	/* Don't trace signals */
 			trussinfo->flags |= NOSIGS;
 			break;
@@ -144,6 +152,12 @@ main(int ac, char **av)
 		 */
 		if ((trussinfo->outfile = fopen(fname, "we")) == NULL)
 			err(1, "cannot open %s", fname);
+	}
+
+	if (trussinfo->cap_mode) {
+		trussinfo->pdkq = kqueue();
+		if (trussinfo->pdkq == -1)
+			err(1, "kqueue");
 	}
 
 	/*

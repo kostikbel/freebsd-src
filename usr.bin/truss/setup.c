@@ -31,13 +31,15 @@
  * SUCH DAMAGE.
  */
 
-#include <sys/cdefs.h>
 /*
  * Various setup functions for truss.  Not the cleanest-written code,
  * I'm afraid.
  */
 
+#include <sys/capsicum.h>
+#include <sys/event.h>
 #include <sys/ptrace.h>
+#include <sys/procdesc.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -59,6 +61,8 @@
 #include "syscall.h"
 #include "extern.h"
 
+#define	WFLAGS	(WTRAPPED | WEXITED | WCONTINUED | WUNTRACED)
+
 struct procabi_table {
 	const char *name;
 	struct procabi *abi;
@@ -68,8 +72,9 @@ static sig_atomic_t detaching;
 
 static void	enter_syscall(struct trussinfo *, struct threadinfo *,
 		    struct ptrace_lwpinfo *);
-static void	new_proc(struct trussinfo *, pid_t, lwpid_t);
-
+static bool	new_proc(struct trussinfo *, int, pid_t, lwpid_t, bool, bool);
+static void	new_proc_register_kev(struct trussinfo *info, int pfd);
+static struct procinfo *find_proc(struct trussinfo *info, pid_t pid);
 
 static struct procabi freebsd = {
 	.type = "FreeBSD",
@@ -138,6 +143,49 @@ static struct procabi_table abis[] = {
 #endif
 };
 
+#if 0
+static int
+t_ptrace(struct trussinfo *info, int req, int pid, caddr_t addr, int data)
+{
+	return (ptrace(req | (info->cap_mode ? PT_PROCDESC : 0), pid,
+	    addr, data));
+}
+#endif
+
+static int
+truss_ptrace(struct trussinfo *info, int req, struct procinfo *p, caddr_t addr,
+    int data)
+{
+	if (info->cap_mode)
+		return (ptrace(req | PT_PROCDESC, p->pfd, addr, data));
+	return (ptrace(req, p->pid, addr, data));
+}
+
+static int
+t_wait(struct trussinfo *info, int pid, int *status, int wflags)
+{
+	if (info->cap_mode)
+		return (pdwait(pid, status, wflags, NULL, NULL));
+	return (waitpid(pid, status, wflags));
+}
+
+static int
+truss_wait(struct trussinfo *info, struct procinfo *p, int *status,
+    int wflags)
+{
+	if (info->cap_mode)
+		return (pdwait(p->pfd, status, wflags, NULL, NULL));
+	return (waitpid(p->pid, status, wflags));
+}
+
+static int
+truss_kill(struct trussinfo *info, struct procinfo *p, int sig)
+{
+	if (info->cap_mode)
+		return (pdkill(p->pfd, sig));
+	return (kill(p->pid, sig));
+}
+
 /*
  * setup_and_wait() is called to start a process.  All it really does
  * is fork(), enable tracing in the child, and then exec the given
@@ -148,21 +196,38 @@ void
 setup_and_wait(struct trussinfo *info, char *command[])
 {
 	pid_t pid;
+	int fd, res;
 
-	pid = vfork();
-	if (pid == -1)
-		err(1, "fork failed");
+	if (info->cap_mode) {
+		pid = pdfork(&fd, PD_DAEMON | PD_CLOEXEC | PD_PTRACE_CAP);
+		if (pid == -1)
+			err(1, "fork failed");
+	} else {
+		pid = vfork();
+		fd = -1;
+	}
 	if (pid == 0) {	/* Child */
 		ptrace(PT_TRACE_ME, 0, 0, 0);
 		execvp(command[0], command);
 		err(1, "execvp %s", command[0]);
 	}
 
+	if (info->cap_mode) {
+		if (cap_enter() == -1) {
+			if (info->force_cap_mode)
+				err(1, "cap_enter");
+			else
+				warn("cap_enter");
+		}
+		new_proc_register_kev(info, fd);
+	}
+
 	/* Only in the parent here */
-	if (waitpid(pid, NULL, 0) < 0)
+	res = t_wait(info, info->cap_mode ? fd : pid, NULL, WFLAGS);
+	if (res < 0)
 		err(1, "unexpected stop in waitpid");
 
-	new_proc(info, pid, 0);
+	new_proc(info, pid, 0, fd, false, false);
 }
 
 /*
@@ -171,20 +236,37 @@ setup_and_wait(struct trussinfo *info, char *command[])
 void
 start_tracing(struct trussinfo *info, pid_t pid)
 {
-	int ret, retry;
+	int fd, ret, retry;
+
+	if (info->cap_mode) {
+		fd = pdopenpid(pid, PD_DAEMON | PD_CLOEXEC | PD_PTRACE_CAP);
+		if (fd == -1)
+			err(1, "Cannot open the target process");
+		if (cap_enter() == -1) {
+			if (info->force_cap_mode)
+				err(1, "cap_enter");
+			else
+				warn("cap_enter");
+		}
+		new_proc_register_kev(info, fd);
+	} else {
+		fd = -1;
+	}
 
 	retry = 10;
 	do {
-		ret = ptrace(PT_ATTACH, pid, NULL, 0);
+		ret = info->cap_mode ? ptrace(PT_ATTACH | PT_PROCDESC, fd,
+		    NULL, 0) : ptrace(PT_ATTACH, pid, NULL, 0);
 		usleep(200);
 	} while (ret && retry-- > 0);
 	if (ret)
 		err(1, "Cannot attach to target process");
 
-	if (waitpid(pid, NULL, 0) < 0)
+	ret = t_wait(info, info->cap_mode ? fd : pid, NULL, WFLAGS);
+	if (ret < 0)
 		err(1, "Unexpected stop in waitpid");
 
-	new_proc(info, pid, 0);
+	new_proc(info, pid, 0, fd, false, false);
 }
 
 /*
@@ -201,31 +283,32 @@ restore_proc(int signo __unused)
 }
 
 static void
-detach_proc(pid_t pid)
+detach_proc(struct trussinfo *info, struct procinfo *p)
 {
-	int sig, status;
+	int error, sig, status;
 
 	/*
 	 * Stop the child so that we can detach.  Filter out possible
 	 * lingering SIGTRAP events buffered in the threads.
 	 */
-	kill(pid, SIGSTOP);
+	truss_kill(info, p, SIGSTOP);
 	for (;;) {
-		if (waitpid(pid, &status, 0) < 0)
+		error = truss_wait(info, p, &status, WFLAGS);
+		if (error < 0)
 			err(1, "Unexpected error in waitpid");
 		sig = WIFSTOPPED(status) ? WSTOPSIG(status) : 0;
 		if (sig == SIGSTOP)
 			break;
 		if (sig == SIGTRAP)
 			sig = 0;
-		if (ptrace(PT_CONTINUE, pid, (caddr_t)1, sig) < 0)
+		if (truss_ptrace(info, PT_CONTINUE, p, (caddr_t)1, sig) < 0)
 			err(1, "Can not continue for detach");
 	}
 
-	if (ptrace(PT_DETACH, pid, (caddr_t)1, 0) < 0)
+	if (truss_ptrace(info, PT_DETACH, p, (caddr_t)1, 0) < 0)
 		err(1, "Can not detach the process");
 
-	kill(pid, SIGCONT);
+	truss_kill(info, p, SIGCONT);
 }
 
 /*
@@ -297,12 +380,12 @@ add_threads(struct trussinfo *info, struct procinfo *p)
 	lwpid_t *lwps;
 	int i, nlwps;
 
-	nlwps = ptrace(PT_GETNUMLWPS, p->pid, NULL, 0);
+	nlwps = truss_ptrace(info, PT_GETNUMLWPS, p, NULL, 0);
 	if (nlwps == -1)
 		err(1, "Unable to fetch number of LWPs");
 	assert(nlwps > 0);
 	lwps = calloc(nlwps, sizeof(*lwps));
-	nlwps = ptrace(PT_GETLWPLIST, p->pid, (caddr_t)lwps, nlwps);
+	nlwps = truss_ptrace(info, PT_GETLWPLIST, p, (caddr_t)lwps, nlwps);
 	if (nlwps == -1)
 		err(1, "Unable to fetch LWP list");
 	for (i = 0; i < nlwps; i++) {
@@ -318,27 +401,56 @@ add_threads(struct trussinfo *info, struct procinfo *p)
 }
 
 static void
-new_proc(struct trussinfo *info, pid_t pid, lwpid_t lwpid)
+new_proc_register_kev(struct trussinfo *info, int pfd)
+{
+	struct kevent ev[1];
+	int error;
+
+	if (!info->cap_mode)
+		return;
+	EV_SET(&ev[0], pfd, EVFILT_PROCDESC, EV_ADD, NOTE_EXIT |
+	    NOTE_PDSIGCHLD | NOTE_FORK, 0, 0);
+	error = kevent(info->pdkq, ev, nitems(ev), NULL, 0, NULL);
+	if (error == -1)
+		err(1, "Unable to register pfd %d for notifications", pfd);
+}
+
+static bool
+new_proc(struct trussinfo *info, pid_t pid, lwpid_t lwpid, int pfd,
+    bool allow_known, bool wait_for)
 {
 	struct procinfo *np;
 
 	/*
-	 * If this happens it means there is a bug in truss.  Unfortunately
-	 * this will kill any processes truss is attached to.
+	 * If this happens it means there is a bug in truss.
+	 * Unfortunately this will kill any processes truss is
+	 * attached to.
 	 */
-	LIST_FOREACH(np, &info->proclist, entries) {
-		if (np->pid == pid)
+	if (find_proc(info, pid) != NULL) {
+		if (allow_known)
+			return (false);
+		else
 			errx(1, "Duplicate process for pid %ld", (long)pid);
 	}
+	if (pfd == -1 && info->cap_mode) {
+		pfd = pdopenpid(pid, PD_DAEMON | PD_CLOEXEC | PD_PTRACE_CAP);
+		if (pfd == -1)
+			err(1, "pdopenid %d", pid);
+		if (wait_for)
+			t_wait(info, pfd, NULL, WFLAGS);
+		new_proc_register_kev(info, pfd);
+	}
 
-	if (info->flags & FOLLOWFORKS)
-		if (ptrace(PT_FOLLOW_FORK, pid, NULL, 1) == -1)
-			err(1, "Unable to follow forks for pid %ld", (long)pid);
-	if (ptrace(PT_LWP_EVENTS, pid, NULL, 1) == -1)
-		err(1, "Unable to enable LWP events for pid %ld", (long)pid);
 	np = calloc(1, sizeof(struct procinfo));
 	np->pid = pid;
+	np->pfd = pfd;
 	np->abi = find_abi(pid);
+	np->herald_printed = false;
+	if ((info->flags & FOLLOWFORKS) != 0 && truss_ptrace(info,
+	    PT_FOLLOW_FORK, np, NULL, 1) == -1)
+		err(1, "Unable to follow forks for pid %ld", (long)pid);
+	if (truss_ptrace(info, PT_LWP_EVENTS, np, NULL, 1) == -1)
+		err(1, "Unable to enable LWP events for pid %ld", (long)pid);
 	LIST_INIT(&np->threadlist);
 	LIST_INIT(&np->fdlist);
 	LIST_INSERT_HEAD(&info->proclist, np, entries);
@@ -347,13 +459,21 @@ new_proc(struct trussinfo *info, pid_t pid, lwpid_t lwpid)
 		new_thread(np, lwpid);
 	else
 		add_threads(info, np);
+	return (true);
 }
 
 static void
-free_proc(struct procinfo *p)
+free_proc(struct trussinfo *info, struct procinfo *p)
 {
 	struct threadinfo *t, *t2;
 	struct fd_domain *f, *f2;
+	struct kevent ev[1];
+
+	if (info->cap_mode) {
+		EV_SET(&ev[0], p->pfd, EVFILT_PROCDESC, EV_DELETE, 0, 0, 0);
+		(void)kevent(info->pdkq, ev, nitems(ev), NULL, 0, 0);
+		close(p->pfd);
+	}
 
 	LIST_FOREACH_SAFE(t, &p->threadlist, entries, t2) {
 		free(t);
@@ -373,8 +493,8 @@ detach_all_procs(struct trussinfo *info)
 	struct procinfo *p, *p2;
 
 	LIST_FOREACH_SAFE(p, &info->proclist, entries, p2) {
-		detach_proc(p->pid);
-		free_proc(p);
+		detach_proc(info, p);
+		free_proc(info, p);
 	}
 }
 
@@ -616,9 +736,9 @@ exit_syscall(struct trussinfo *info, struct ptrace_lwpinfo *pl)
 		assert(LIST_NEXT(LIST_FIRST(&p->threadlist), entries) == NULL);
 		p->abi = find_abi(p->pid);
 		if (p->abi == NULL) {
-			if (ptrace(PT_DETACH, p->pid, (caddr_t)1, 0) < 0)
+			if (truss_ptrace(info, PT_DETACH, p, (caddr_t)1, 0) < 0)
 				err(1, "Can not detach the process");
-			free_proc(p);
+			free_proc(info, p);
 		}
 	}
 }
@@ -701,6 +821,9 @@ report_new_child(struct trussinfo *info)
 	struct threadinfo *t;
 
 	t = info->curthread;
+	if (t->proc->herald_printed)
+		return;
+	t->proc->herald_printed = true;
 	clock_gettime(CLOCK_REALTIME, &t->after);
 	t->before = t->after;
 	print_line_prefix(info);
@@ -780,6 +903,85 @@ report_signal(struct trussinfo *info, siginfo_t *si, struct ptrace_lwpinfo *pl)
 	
 }
 
+static void
+eventloop_handle_trapped(struct trussinfo *info, pid_t si_pid, int si_status,
+    siginfo_t *si)
+{
+	struct ptrace_lwpinfo pl;
+	int pending_signal;
+
+	if (ptrace(PT_LWPINFO, si_pid, (caddr_t)&pl, sizeof(pl)) == -1)
+		err(1, "ptrace(PT_LWPINFO)");
+
+	if ((pl.pl_flags & PL_FLAG_CHILD) != 0) {
+		new_proc(info, si_pid, pl.pl_lwpid, -1, true, false);
+		assert(LIST_FIRST(&info->proclist)->abi != NULL);
+	} else if ((pl.pl_flags & PL_FLAG_BORN) != 0) {
+		new_thread(find_proc(info, si_pid),
+		    pl.pl_lwpid);
+	}
+	find_thread(info, si_pid, pl.pl_lwpid);
+
+	pending_signal = 0;
+	if (si_status == SIGTRAP && (pl.pl_flags & (PL_FLAG_BORN |
+	    PL_FLAG_EXITED | PL_FLAG_SCE | PL_FLAG_SCX)) != 0) {
+		if ((pl.pl_flags & PL_FLAG_BORN) != 0) {
+			if ((info->flags & COUNTONLY) == 0)
+				report_thread_birth(info);
+		} else if ((pl.pl_flags & PL_FLAG_EXITED) != 0) {
+			if ((info->flags & COUNTONLY) == 0)
+				report_thread_death(info);
+			free_thread(info->curthread);
+			info->curthread = NULL;
+		} else if ((pl.pl_flags & PL_FLAG_SCE) != 0) {
+			enter_syscall(info, info->curthread, &pl);
+		} else if ((pl.pl_flags & PL_FLAG_SCX) != 0) {
+			exit_syscall(info, &pl);
+		}
+	} else if ((pl.pl_flags & PL_FLAG_CHILD) != 0) {
+		if ((info->flags & COUNTONLY) == 0)
+			report_new_child(info);
+	} else if (si != NULL) {
+		if ((info->flags & NOSIGS) == 0)
+			report_signal(info, si, &pl);
+		pending_signal = si->si_status;
+	}
+	if (ptrace(PT_SYSCALL, si_pid, (caddr_t)1, pending_signal) == -1)
+		err(1, "ptrace(PT_SYSCALL)");
+}
+
+static void
+eventloop_handle_note_fork(struct trussinfo *info)
+{
+	struct ptrace_child *ptcs;
+	int cnt, i;
+
+	cnt = ptrace(PT_GET_CHILDREN, getpid(), NULL, 0);
+	if (cnt == -1)
+		err(1, "Unexpected error from ptrace(PT_GET_CHILDREN) size");
+	if (cnt == 0)
+		return;
+	ptcs = calloc(cnt, sizeof(*ptcs));
+	if (ptcs == NULL)
+		err(1, "No memory");
+	cnt = ptrace(PT_GET_CHILDREN, getpid(), (caddr_t)ptcs,
+	    cnt * sizeof(*ptcs));
+	if (cnt == -1)
+		err(1, "Unexpected error from ptrace(PT_GET_CHILDREN) data");
+	for (i = 0; i < cnt; i++) {
+		if ((ptcs[i].flags & (PTCHLD_TRACED | PTCHLD_TRACED_BY_ME |
+		    PTCHLD_EXITED)) != (PTCHLD_TRACED | PTCHLD_TRACED_BY_ME))
+			continue;
+		if (new_proc(info, ptcs[i].pid, 0, -1, true, true)) {
+			if ((info->flags & COUNTONLY) == 0)
+				report_new_child(info);
+			eventloop_handle_trapped(info, ptcs[i].pid, SIGTRAP,
+			    NULL);
+		}
+	}
+	free(ptcs);
+}
+
 /*
  * Wait for events until all the processes have exited or truss has been
  * asked to stop.
@@ -787,9 +989,10 @@ report_signal(struct trussinfo *info, siginfo_t *si, struct ptrace_lwpinfo *pl)
 void
 eventloop(struct trussinfo *info)
 {
-	struct ptrace_lwpinfo pl;
 	siginfo_t si;
-	int pending_signal;
+	struct kevent ev[1];
+	int cnt, error;
+	bool has_si;
 
 	while (!LIST_EMPTY(&info->proclist)) {
 		if (detaching) {
@@ -797,11 +1000,52 @@ eventloop(struct trussinfo *info)
 			return;
 		}
 
-		if (waitid(P_ALL, 0, &si, WTRAPPED | WEXITED) == -1) {
-			if (errno == EINTR)
+		has_si = false;
+		if (info->cap_mode) {
+			cnt = kevent(info->pdkq, NULL, 0, ev, nitems(ev),
+			    NULL);
+			if (cnt == -1) {
+				if (errno == EINTR)
+					continue;
+				err(1, "Unexpected error from kevent");
+			}
+			if (cnt == 0) {
+				/* XXXKIB ? */
 				continue;
-			err(1, "Unexpected error from waitid");
+			}
+			if ((ev[0].fflags & (NOTE_EXIT | NOTE_PDSIGCHLD)) !=
+			    0) {
+				error = pdwait(ev[0].ident, NULL,
+				    WFLAGS | WNOHANG, NULL, &si);
+				if (error == -1) {
+					if (errno == EINTR ||
+					    errno == EWOULDBLOCK)
+						continue;
+					err(1, "Unexpected error from pdwait");
+				}
+				has_si = true;
+
+				/*
+				 * To get rid of zombie, we need to
+				 * waitpid() on it in addition to the
+				 * pdwait() above, because we are the
+				 * debugger, and the child was
+				 * reparented to us.
+				 */
+				waitpid(si.si_pid, NULL, WEXITED | WNOHANG);
+			}
+			if ((ev[0].fflags & NOTE_FORK) != 0)
+				eventloop_handle_note_fork(info);
+		} else {
+			if (waitid(P_ALL, 0, &si, WTRAPPED | WEXITED) == -1) {
+				if (errno == EINTR)
+					continue;
+				err(1, "Unexpected error from waitid");
+			}
+			has_si = true;
 		}
+		if (!has_si)
+			continue;
 
 		assert(si.si_signo == SIGCHLD);
 
@@ -815,50 +1059,12 @@ eventloop(struct trussinfo *info)
 					thread_exit_syscall(info);
 				report_exit(info, &si);
 			}
-			free_proc(info->curthread->proc);
+			free_proc(info, info->curthread->proc);
 			info->curthread = NULL;
 			break;
 		case CLD_TRAPPED:
-			if (ptrace(PT_LWPINFO, si.si_pid, (caddr_t)&pl,
-			    sizeof(pl)) == -1)
-				err(1, "ptrace(PT_LWPINFO)");
-
-			if (pl.pl_flags & PL_FLAG_CHILD) {
-				new_proc(info, si.si_pid, pl.pl_lwpid);
-				assert(LIST_FIRST(&info->proclist)->abi !=
-				    NULL);
-			} else if (pl.pl_flags & PL_FLAG_BORN)
-				new_thread(find_proc(info, si.si_pid),
-				    pl.pl_lwpid);
-			find_thread(info, si.si_pid, pl.pl_lwpid);
-
-			if (si.si_status == SIGTRAP &&
-			    (pl.pl_flags & (PL_FLAG_BORN|PL_FLAG_EXITED|
-			    PL_FLAG_SCE|PL_FLAG_SCX)) != 0) {
-				if (pl.pl_flags & PL_FLAG_BORN) {
-					if ((info->flags & COUNTONLY) == 0)
-						report_thread_birth(info);
-				} else if (pl.pl_flags & PL_FLAG_EXITED) {
-					if ((info->flags & COUNTONLY) == 0)
-						report_thread_death(info);
-					free_thread(info->curthread);
-					info->curthread = NULL;
-				} else if (pl.pl_flags & PL_FLAG_SCE)
-					enter_syscall(info, info->curthread, &pl);
-				else if (pl.pl_flags & PL_FLAG_SCX)
-					exit_syscall(info, &pl);
-				pending_signal = 0;
-			} else if (pl.pl_flags & PL_FLAG_CHILD) {
-				if ((info->flags & COUNTONLY) == 0)
-					report_new_child(info);
-				pending_signal = 0;
-			} else {
-				if ((info->flags & NOSIGS) == 0)
-					report_signal(info, &si, &pl);
-				pending_signal = si.si_status;
-			}
-			ptrace(PT_SYSCALL, si.si_pid, (caddr_t)1,
-			    pending_signal);
+			eventloop_handle_trapped(info, si.si_pid,
+			    si.si_status, &si);
 			break;
 		case CLD_STOPPED:
 			errx(1, "waitid reported CLD_STOPPED");

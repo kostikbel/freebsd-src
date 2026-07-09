@@ -7,7 +7,7 @@
 .Nd trace system calls
 .Sh SYNOPSIS
 .Nm
-.Op Fl facedDHS
+.Op Fl facedyDHSY
 .Op Fl o Ar file
 .Op Fl s Ar strsize
 .Fl p Ar pid
@@ -62,6 +62,22 @@ Do not display information about signals received by the process.
 (Normally,
 .Nm
 displays signal as well as system call events.)
+.It Fl y
+Enter the capability mode
+.Pq see Xr capsicum 4
+after opening the output file, and creating and
+attaching to the target process.
+The error to enter the mode is not fatal, but a warning is
+issued to the standard error.
+.It Fl Y
+Same as
+.Fl y ,
+but make the error to enter the capability mode fatal.
+Since the traced process is spawn and attached to
+before the entry into the mode, it is killed by
+the termination of the
+.Nm
+itself.
 .It Fl o Ar file
 Print the output to the specified
 .Ar file
