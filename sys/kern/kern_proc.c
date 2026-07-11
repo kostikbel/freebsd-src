@@ -38,6 +38,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bitstring.h>
+#include <sys/capsicum.h>
 #include <sys/conf.h>
 #include <sys/elf.h>
 #include <sys/eventhandler.h>
@@ -2402,12 +2403,19 @@ sysctl_kern_proc_sv_name(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 
 	name = (int *)arg1;
+	sx_slock(&proctree_lock);
 	error = pget((pid_t)name[0], PGET_CANSEE, &p);
 	if (error != 0)
-		return (error);
-	sv_name = p->p_sysent->sv_name;
+		goto out;
+	error = p_canopen(curthread, p);
+	if (error == 0)
+		sv_name = p->p_sysent->sv_name;
 	PROC_UNLOCK(p);
-	return (sysctl_handle_string(oidp, sv_name, 0, req));
+out:
+	sx_sunlock(&proctree_lock);
+	if (error == 0)
+		error = sysctl_handle_string(oidp, sv_name, 0, req);
+	return (error);
 }
 
 #ifdef KINFO_OVMENTRY_SIZE
@@ -3433,7 +3441,7 @@ static SYSCTL_NODE(_kern_proc, KERN_PROC_PATHNAME, pathname, CTLFLAG_RD |
 	CTLFLAG_MPSAFE, sysctl_kern_proc_pathname, "Process executable path");
 
 static SYSCTL_NODE(_kern_proc, KERN_PROC_SV_NAME, sv_name, CTLFLAG_RD |
-	CTLFLAG_MPSAFE, sysctl_kern_proc_sv_name,
+	CTLFLAG_MPSAFE | CTLFLAG_CAPRD, sysctl_kern_proc_sv_name,
 	"Process syscall vector name (ABI type)");
 
 static SYSCTL_NODE(_kern_proc, (KERN_PROC_GID | KERN_PROC_INC_THREAD), gid_td,
