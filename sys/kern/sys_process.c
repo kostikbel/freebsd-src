@@ -1064,6 +1064,11 @@ ptrace_sel_coredump_thread(struct proc *p)
 	return (NULL);
 }
 
+bool allow_ptrace_in_cap_mode = true;
+SYSCTL_BOOL(_security_bsd, OID_AUTO, allow_ptrace_in_cap_mode, CTLFLAG_RWTUN,
+    &allow_ptrace_in_cap_mode, 0,
+    "Allow ptrace(2) in capability mode");
+
 static int
 ptraceimpl(struct thread *td, int req, bool pd_mode, int pid, void *addr,
     int data)

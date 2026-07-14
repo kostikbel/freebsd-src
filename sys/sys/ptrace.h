@@ -295,6 +295,7 @@ int	proc_write_dbregs32(struct thread *_td, struct dbreg32 *_dbreg32);
 void	ptrace_unsuspend(struct proc *p);
 
 extern bool allow_ptrace;
+extern bool allow_ptrace_in_cap_mode;
 
 #else /* !_KERNEL */
 
