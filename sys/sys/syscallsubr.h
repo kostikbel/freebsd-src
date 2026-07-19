@@ -299,6 +299,8 @@ int	kern_posix_fallocate(struct thread *td, int fd, off_t offset,
 	    off_t len);
 int	kern_fspacectl(struct thread *td, int fd, int cmd,
 	    const struct spacectl_range *, int flags, struct spacectl_range *);
+int	kern_pdptrace(struct thread *td, int req, int pfd, void *addr,
+	    int data);
 int	kern_pdwait(struct thread *td, int fd, int *status,
 	    int options, struct __wrusage *wrusage, siginfo_t *sip);
 int	kern_procctl(struct thread *td, enum idtype idtype, id_t id, int com,
