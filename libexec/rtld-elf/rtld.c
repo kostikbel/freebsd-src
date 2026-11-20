@@ -2690,13 +2690,22 @@ initlist_for_loaded_obj(Obj_Entry *obj, Obj_Entry *tail, Objlist *list)
 	/*
 	 * This might result in the same object appearing more
 	 * than once on the init list.  objlist_call_init()
-	 * uses obj->init_scanned to avoid dup calls.
+	 * uses obj->init_done to avoid dup calls.
 	 */
 	STAILQ_REVERSE(&iflist, Struct_Objlist_Entry, link);
 	STAILQ_FOREACH(tmp, &iflist, link)
 		objlist_push_head(list, tmp->obj);
 
 	objlist_clear(&iflist);
+
+	/*
+	 * init_scanned only guards this walk.  Clear it before the
+	 * bind lock can be dropped, e.g. for the IFUNC resolvers, so
+	 * that a list built meanwhile by another thread, or by a
+	 * nested dlopen(3), does not skip the objects.
+	 */
+	STAILQ_FOREACH(tmp, list, link)
+		tmp->obj->init_scanned = false;
 }
 
 static void
@@ -3367,23 +3376,11 @@ static void
 objlist_call_init(Objlist *list, RtldLockState *lockstate)
 {
 	Objlist_Entry *elm;
-	Obj_Entry *obj;
 	struct dlerror_save *saved_msg;
 	uintptr_t *init_addr;
 	void (*reg)(void (*)(void));
 	long my_lwpid;
 	int index;
-
-	/*
-	 * Clean init_scanned flag so that objects can be rechecked and
-	 * possibly initialized earlier if any of vectors called below
-	 * cause the change by using dlopen.
-	 */
-	TAILQ_FOREACH(obj, &obj_list, next) {
-		if (obj->marker)
-			continue;
-		obj->init_scanned = false;
-	}
 
 	/*
 	 * Preserve the current error message since an init function might
