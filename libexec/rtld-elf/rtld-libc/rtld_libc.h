@@ -35,6 +35,7 @@
 #include <sys/types.h>
 #include <sys/fcntl.h>
 #include <sys/stat.h>
+#include <sys/_timespec.h>
 
 /* Avoid dependencies on libthr (used by closedir/opendir/readdir) */
 #define __isthreaded 0
@@ -49,6 +50,7 @@ int	__sys_fcntl(int, int, ...);
 int	__sys_fstat(int fd, struct stat *);
 int	__sys_fstatat(int, const char *, struct stat *, int);
 int	__sys___getcwd(char *, size_t);
+int	__sys_nanosleep(const struct timespec *, struct timespec *);
 int	__sys_open(const char *, int, ...);
 int	__sys_openat(int, const char *, int, ...);
 int	__sys_sigprocmask(int, const sigset_t *, sigset_t *);

@@ -56,7 +56,7 @@ CFLAGS.strtok.c+=-Wno-cast-qual
 _libsys_other_objects= fstat fstatat fstatfs syscall \
     cerror geteuid getegid sigfastblock munmap mprotect \
     sysarch __sysctl issetugid __getcwd utrace getpid \
-    thr_self thr_kill pread mmap lseek _exit \
+    thr_self thr_kill pread mmap _nanosleep lseek _exit \
     getdirentries _close _fcntl _open _openat _read \
     _sigprocmask _write readlink ___realpathat
 # A few other bits from libc_nossp_pic:
