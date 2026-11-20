@@ -44,6 +44,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/thr.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 
@@ -2704,7 +2705,7 @@ initlist_add_objects(Obj_Entry *obj, Obj_Entry *tail, Objlist *list,
 {
 	Obj_Entry *nobj;
 
-	if (obj->init_done)
+	if (obj->initializers_done)
 		return;
 
 	if (obj->z_initfirst || list == NULL) {
@@ -3186,8 +3187,9 @@ preinit_main(RtldLockState *lockstate)
  * Call the finalization functions for each of the objects in "list"
  * belonging to the DAG of "root" and referenced once. If NULL "root"
  * is specified, every finalization function will be called regardless
- * of the reference count and the list elements won't be freed. All of
- * the objects are expected to have non-NULL fini functions.
+ * of the reference count, except for the objects whose initializers
+ * did not finish, and the list elements won't be freed. All of the
+ * objects are expected to have non-NULL fini functions.
  */
 static void
 objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
@@ -3195,6 +3197,7 @@ objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
 	Objlist_Entry *elm;
 	struct dlerror_save *saved_msg;
 	uintptr_t *fini_addr;
+	long my_lwpid;
 	int index;
 
 	assert(root == NULL || root->refcount == 1);
@@ -3207,6 +3210,7 @@ objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
 	 * call into the dynamic linker and overwrite it.
 	 */
 	saved_msg = errmsg_save();
+	thr_self(&my_lwpid);
 	do {
 		STAILQ_FOREACH(elm, list, link) {
 			if (root != NULL &&
@@ -3214,8 +3218,22 @@ objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
 				objlist_find(&root->dagmembers, elm->obj) ==
 				    NULL))
 				continue;
-			/* Remove object from fini list to prevent recursive
-			 * invocation. */
+			/*
+			 * At exit, skip an object whose initializers did
+			 * not finish, unless this thread runs them.  They
+			 * either run in another thread, or a dlopen(3) in
+			 * progress has not called them yet.  Waiting for
+			 * them could block exit(3) forever, e.g. in a
+			 * fork(2) child.
+			 */
+			if (root == NULL && !elm->obj->initializers_done &&
+			    (!elm->obj->init_done ||
+			    elm->obj->initializing_lwpid != my_lwpid))
+				continue;
+			/*
+			 * Remove object from fini list to prevent recursive
+			 * invocation.
+			 */
 			STAILQ_REMOVE(list, elm, Struct_Objlist_Entry, link);
 			/* Ensure that new references cannot be acquired. */
 			elm->obj->doomed = true;
@@ -3272,6 +3290,75 @@ objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
 }
 
 /*
+ * Drop the bind lock, sleep for a millisecond, and take the lock again
+ * for write.  Used to busy-wait for another thread.
+ */
+static void
+rtld_bind_pause(RtldLockState *lockstate)
+{
+	struct timespec ts;
+
+	lock_release(rtld_bind_lock, lockstate);
+	ts.tv_sec = 0;
+	ts.tv_nsec = 1000000;
+	__sys_nanosleep(&ts, NULL); /* no cancel */
+	wlock_acquire(rtld_bind_lock, lockstate);
+}
+
+/*
+ * Wait for another thread to finish running the initializers of obj.
+ * Returns true if the bind lock was dropped while waiting.
+ *
+ * The wait might never finish in a child created by fork(2) while an
+ * initializer for obj was running in the parent.  The child inherits
+ * init_done set and initializers_done clear.  If the initializer was
+ * running in another parent thread, no thread in the child ever
+ * finishes it.  If it was running in the forking thread, the child
+ * thread does finish it, but the child thread has a new lwpid.  A
+ * dlopen(3) called from that initializer in the child does not match
+ * initializing_lwpid, and waits for itself.
+ */
+static bool
+obj_wait_for_init(Obj_Entry *obj, long my_lwpid, RtldLockState *lockstate)
+{
+	if (!obj->init_done || obj->initializers_done ||
+	    obj->initializing_lwpid == my_lwpid)
+		return (false);
+
+	/*
+	 * Race: we might try to use this object before
+	 * other thread completes the initialization.
+	 * Busy wait for it.
+	 */
+	hold_object(obj);
+	while (!obj->initializers_done)
+		rtld_bind_pause(lockstate);
+	unhold_object(obj);
+	return (true);
+}
+
+/*
+ * Wait for all members of the root DAG that other threads are still
+ * initializing.  A member can still be in its initializers after root
+ * is done: when root is dlopen()ed from that member's initializer,
+ * objlist_call_init() skips the member because it is owned by the
+ * current thread.  The bind lock is dropped while waiting, so rescan
+ * the list after each wait.
+ */
+static void
+obj_wait_for_init_dag(Obj_Entry *root, long my_lwpid,
+    RtldLockState *lockstate)
+{
+	Objlist_Entry *elm;
+
+again:
+	STAILQ_FOREACH(elm, &root->dagmembers, link) {
+		if (obj_wait_for_init(elm->obj, my_lwpid, lockstate))
+			goto again;
+	}
+}
+
+/*
  * Call the initialization functions for each of the objects in
  * "list".  All of the objects are expected to have non-NULL init
  * functions.
@@ -3284,6 +3371,7 @@ objlist_call_init(Objlist *list, RtldLockState *lockstate)
 	struct dlerror_save *saved_msg;
 	uintptr_t *init_addr;
 	void (*reg)(void (*)(void));
+	long my_lwpid;
 	int index;
 
 	/*
@@ -3302,15 +3390,15 @@ objlist_call_init(Objlist *list, RtldLockState *lockstate)
 	 * call into the dynamic linker and overwrite it.
 	 */
 	saved_msg = errmsg_save();
+	thr_self(&my_lwpid);
 	STAILQ_FOREACH(elm, list, link) {
-		if (elm->obj->init_done) /* Initialized early. */
+		if (elm->obj->init_done) {	/* Initialized earlier. */
+			obj_wait_for_init(elm->obj, my_lwpid, lockstate);
 			continue;
-		/*
-		 * Race: other thread might try to use this object before
-		 * current one completes the initialization. Not much can be
-		 * done here without better locking.
-		 */
+		}
+
 		elm->obj->init_done = true;
+		elm->obj->initializing_lwpid = my_lwpid;
 		hold_object(elm->obj);
 		reg = NULL;
 		if (elm->obj == obj_main && obj_main->crt_no_init) {
@@ -3353,6 +3441,7 @@ objlist_call_init(Objlist *list, RtldLockState *lockstate)
 			}
 		}
 		wlock_acquire(rtld_bind_lock, lockstate);
+		elm->obj->initializers_done = true;
 		unhold_object(elm->obj);
 	}
 	errmsg_restore(saved_msg);
@@ -4104,6 +4193,8 @@ dlopen_object(const char *name, int fd, Obj_Entry *refobj, int lo_flags,
 			if (obj != NULL)
 				process_z(obj);
 		} else {
+			long my_lwpid;
+
 			/*
 			 * Bump the reference counts for objects on this DAG. If
 			 * this is the first dlopen() call for the object that
@@ -4115,6 +4206,9 @@ dlopen_object(const char *name, int fd, Obj_Entry *refobj, int lo_flags,
 
 			if ((lo_flags & RTLD_LO_TRACE) != 0)
 				goto trace;
+
+			thr_self(&my_lwpid);
+			obj_wait_for_init_dag(obj, my_lwpid, lockstate);
 		}
 		if (obj != NULL &&
 		    ((lo_flags & RTLD_LO_NODELETE) != 0 || obj->z_nodelete) &&

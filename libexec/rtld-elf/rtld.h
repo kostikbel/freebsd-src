@@ -223,6 +223,7 @@ typedef struct Struct_Obj_Entry {
 
     int32_t osrel;		/* OSREL note value */
     uint32_t fctl0;		/* FEATURE_CONTROL note desc[0] value */
+    long initializing_lwpid;	/* Thread calling the initializers */
 
     bool mainprog : 1;		/* True if this is the main program */
     bool rtld : 1;		/* True if this is the dynamic linker */
@@ -234,7 +235,8 @@ typedef struct Struct_Obj_Entry {
     bool bind_now : 1;		/* True if all relocations should be made first */
     bool traced : 1;		/* Already printed in ldd trace output */
     bool jmpslots_done : 1;	/* Already have relocated the jump slots */
-    bool init_done : 1;		/* Already have added object to init list */
+    bool initializers_done : 1;	/* All initializers finished */
+    bool init_done : 1;		/* Initializers started, maybe not finished */
     bool tls_static : 1;	/* Already allocated offset for static TLS */
     bool tls_dynamic : 1;	/* A non-static DTV entry has been allocated */
     bool phdr_alloc : 1;	/* Phdr is allocated and needs to be freed. */
