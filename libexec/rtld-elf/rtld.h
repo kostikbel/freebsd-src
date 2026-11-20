@@ -224,6 +224,7 @@ typedef struct Struct_Obj_Entry {
     int32_t osrel;		/* OSREL note value */
     uint32_t fctl0;		/* FEATURE_CONTROL note desc[0] value */
     long initializing_lwpid;	/* Thread calling the initializers */
+    long ifuncs_lwpid;		/* Thread calling the IFUNC resolvers */
 
     bool mainprog : 1;		/* True if this is the main program */
     bool rtld : 1;		/* True if this is the dynamic linker */
@@ -262,6 +263,7 @@ typedef struct Struct_Obj_Entry {
     bool gnu_ifunc : 1;		/* Object has references to STT_GNU_IFUNC */
     bool non_plt_gnu_ifunc : 1;	/* Object has non-plt IFUNC references */
     bool ifuncs_resolved : 1;	/* Object ifuncs were already resolved */
+    bool ifuncs_resolving : 1;	/* Object ifuncs are being resolved */
     bool crt_no_init : 1;	/* Object' crt does not call _init/_fini */
     bool valid_hash_sysv : 1;	/* A valid System V hash hash tag is available */
     bool valid_hash_gnu : 1;	/* A valid GNU hash tag is available */

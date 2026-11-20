@@ -3698,13 +3698,46 @@ static int
 resolve_object_ifunc(Obj_Entry *obj, bool bind_now, int flags,
     RtldLockState *lockstate)
 {
+	long my_lwpid;
+	int res;
+
 	if (obj->ifuncs_resolved)
 		return (0);
-	obj->ifuncs_resolved = true;
+	if (obj->ifuncs_resolving) {
+		/*
+		 * The resolvers run with the bind lock dropped.  If
+		 * another thread runs them, wait for it to finish, so
+		 * that our caller neither runs the initializers nor
+		 * returns the object from dlopen(3) too early.  Do not
+		 * wait for ourselves when our own resolver recursed
+		 * into rtld.  As with obj_wait_for_init(), the wait
+		 * never finishes in a fork(2) child if the resolvers
+		 * were running in another thread of the parent.
+		 */
+		thr_self(&my_lwpid);
+		if (obj->ifuncs_lwpid != my_lwpid) {
+			hold_object(obj);
+			while (!obj->ifuncs_resolved)
+				rtld_bind_pause(lockstate);
+			unhold_object(obj);
+		}
+		return (0);
+	}
+
+	/*
+	 * reloc_iresolve() and friends clear these flags when they
+	 * start, so the test is valid only while nobody is resolving.
+	 */
 	if (!obj->irelative && !obj->irelative_nonplt &&
 	    !((obj->bind_now || bind_now) && obj->gnu_ifunc) &&
-	    !obj->non_plt_gnu_ifunc)
+	    !obj->non_plt_gnu_ifunc) {
+		obj->ifuncs_resolved = true;
 		return (0);
+	}
+
+	thr_self(&obj->ifuncs_lwpid);
+	obj->ifuncs_resolving = true;
+	res = 0;
 	if (obj_disable_relro(obj) == -1 ||
 	    (obj->irelative && reloc_iresolve(obj, lockstate) == -1) ||
 	    (obj->irelative_nonplt &&
@@ -3715,8 +3748,10 @@ resolve_object_ifunc(Obj_Entry *obj, bool bind_now, int flags,
 	    reloc_non_plt(obj, &obj_rtld, flags | SYMLOOK_IFUNC,
 	    lockstate) == -1) ||
 	    obj_enforce_relro(obj) == -1)
-		return (-1);
-	return (0);
+		res = -1;
+	obj->ifuncs_resolving = false;
+	obj->ifuncs_resolved = true;
+	return (res);
 }
 
 static int
