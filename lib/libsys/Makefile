@@ -32,7 +32,12 @@ CFLAGS+=-I${LIBSYS_SRCTOP}/${LIBC_ARCH}
 CFLAGS+=-I${LIBC_SRCTOP}/${LIBC_ARCH}
 
 .PATH: ${LIBC_SRCTOP}/string
-SRCS+=	memcpy.c memset.c strlcpy.c
+SRCS+=	\
+	fls.c \
+	flsl.c \
+	memcmp.c \
+	strlcpy.c \
+	stpcpy.c
 
 CLEANFILES+=tags
 INSTALL_PIC_ARCHIVE=
@@ -63,7 +68,10 @@ NOASM=
 
 SYM_MAPS+=	${LIBSYS_SRCTOP}/Symbol.map
 SRCS+=	auxv.c \
-	interposing_table.c
+	interposing_table.c \
+	memcpy.c \
+	memset.c \
+	strlen.c
 
 .include "${LIBSYS_SRCTOP}/Makefile.sys"
 
