@@ -48,6 +48,9 @@ PRECIOUSLIB=
 # it will be loaded during program startup.
 CFLAGS+= -ftls-model=initial-exec
 
+CFLAGS+= -nostdlib -ffreestanding
+LDFLAGS+= -nostdlib
+
 #
 # Link with static libcompiler_rt.a.
 #
