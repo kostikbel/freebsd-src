@@ -14,6 +14,7 @@ WARNS?=	2
 
 LDFLAGS+=	-nodefaultlibs
 LDFLAGS+=	-Wl,-Bsymbolic
+LDFLAGS+=	-Wl,-znodelete
 LIBADD+=	c
 LIBADD+=	compiler_rt
 

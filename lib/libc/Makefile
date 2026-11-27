@@ -71,6 +71,7 @@ LDFLAGS+=	-Wl,--rpath=/usr/lib${COMPAT_libcompat}
 .endif
 
 LDFLAGS+=-Wl,--auxiliary,libsys.so.7
+LDFLAGS+=-Wl,-znodelete
 
 .if ${MK_SSP} != "no" && \
     (${LIBC_ARCH} == "i386" || ${LIBC_ARCH:Mpowerpc*} != "")

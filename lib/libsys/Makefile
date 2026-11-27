@@ -50,6 +50,7 @@ CFLAGS+= -ftls-model=initial-exec
 
 CFLAGS+= -nostdlib -ffreestanding
 LDFLAGS+= -nostdlib
+LDFLAGS+=-Wl,-znodelete
 
 #
 # Link with static libcompiler_rt.a.
