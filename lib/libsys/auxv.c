@@ -27,16 +27,18 @@
  */
 
 #include "namespace.h"
+#include <sys/auxv.h>
+#include <sys/umtx.h>
+#include <machine/atomic.h>
 #include <elf.h>
 #include <errno.h>
+#include <limits.h>
 #include <link.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <string.h>
-#include <sys/auxv.h>
 #include "un-namespace.h"
 #include "libc_private.h"
-#include <machine/atomic.h>
 
 extern int _DYNAMIC;
 #pragma weak _DYNAMIC
@@ -44,7 +46,52 @@ extern int _DYNAMIC;
 void *__elf_aux_vector;
 
 #ifndef PIC
-static pthread_once_t aux_vector_once = PTHREAD_ONCE_INIT;
+#define ONCE_NEVER_DONE		0x1001
+#define ONCE_DONE		0x1002
+#define	ONCE_IN_PROGRESS	0x1003
+#define ONCE_WAIT		0x1004
+
+static int
+auxv_once(u_int *once_control, void (*init_routine)(void))
+{
+	int state;
+
+	for (;;) {
+		state = atomic_load_int(once_control);
+		if (state == ONCE_DONE) {
+			atomic_thread_fence_acq();
+			return (0);
+		}
+		if (state == ONCE_NEVER_DONE) {
+			if (atomic_cmpset_int(once_control, state,
+			    ONCE_IN_PROGRESS))
+				break;
+		} else if (state == ONCE_IN_PROGRESS) {
+			if (atomic_cmpset_int(once_control, state,
+			    ONCE_WAIT)) {
+				_umtx_op(once_control,
+				    UMTX_OP_WAIT_UINT_PRIVATE,
+				    ONCE_WAIT, NULL, NULL);
+			}
+		} else if (state == ONCE_WAIT) {
+			_umtx_op(once_control, UMTX_OP_WAIT_UINT_PRIVATE,
+			    state, NULL, NULL);
+		} else {
+			return (EINVAL);
+		}
+        }
+
+	init_routine();
+	if (atomic_cmpset_rel_int(once_control, ONCE_IN_PROGRESS,
+	    ONCE_DONE))
+		return (0);
+	atomic_store_rel_int(once_control, ONCE_DONE);
+	_umtx_op(once_control, UMTX_OP_WAKE_PRIVATE, INT_MAX, 0, 0);
+	return (0);
+}
+
+
+static u_int aux_vector_once = ONCE_NEVER_DONE;
 
 static void
 init_aux_vector_once(void)
@@ -63,7 +110,7 @@ __init_elf_aux_vector(void)
 
 	if (&_DYNAMIC != NULL)
 		return;
-	_once(&aux_vector_once, init_aux_vector_once);
+	auxv_once(&aux_vector_once, init_aux_vector_once);
 }
 #endif
 
