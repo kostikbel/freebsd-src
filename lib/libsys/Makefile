@@ -44,7 +44,7 @@ INSTALL_PIC_ARCHIVE=
 #XXX? BUILD_NOSSP_PIC_ARCHIVE=
 PRECIOUSLIB=
 
-# Use a more efficient TLS model for libc since we can reasonably assume that
+# Use a more efficient TLS model for libsys since we can reasonably assume that
 # it will be loaded during program startup.
 CFLAGS+= -ftls-model=initial-exec
 
